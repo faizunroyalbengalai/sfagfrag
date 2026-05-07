@@ -31,16 +31,18 @@ variable "instance_type" {
 
 data "aws_vpc" "default" {
   default = true
+  lifecycle {
+    postcondition {
+      condition     = self.id != ""
+      error_message = "No default VPC found. Please create a default VPC or specify one."
+    }
+  }
 }
 
 data "aws_subnets" "default" {
   filter {
     name   = "vpc-id"
     values = [data.aws_vpc.default.id]
-  }
-  filter {
-    name   = "availabilityZone"
-    values = ["${var.aws_region}a", "${var.aws_region}b", "${var.aws_region}c"]
   }
 }
 
