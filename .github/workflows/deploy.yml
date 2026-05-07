@@ -64,6 +64,17 @@ jobs:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
+      - name: Ensure default VPC exists
+        run: |
+          DEFAULT_VPC=$(aws ec2 describe-vpcs \
+            --filters "Name=isDefault,Values=true" \
+            --query "Vpcs[0].VpcId" --output text 2>/dev/null || echo "None")
+          if [ "$DEFAULT_VPC" == "None" ] || [ -z "$DEFAULT_VPC" ]; then
+            echo "No default VPC found. Creating one..."
+            aws ec2 create-default-vpc
+          else
+            echo "Default VPC exists: $DEFAULT_VPC"
+          fi
       - name: Check existing EC2
         id: check_ec2
         run: |
@@ -179,4 +190,3 @@ jobs:
           for i in $(seq 1 12); do
             curl -sf http://${{ needs.provision.outputs.server_ip }}/health && break || sleep 15
           done
-
