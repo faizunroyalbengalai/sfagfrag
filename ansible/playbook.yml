@@ -1,0 +1,191 @@
+---
+- name: Deploy efefefe
+  hosts: all
+  become: true
+  gather_facts: yes
+  # Retry SSH connections — EC2 instances sometimes drop the connection under load
+  # during the first heavy task (apt-get update) right after boot.
+  vars:
+    ansible_ssh_retries: 5
+    app_dir: /opt/app
+    app_port: 8000
+    project: 'efefefe'
+    web_server: 'nginx'
+    docker_image: '{{ docker_image }}'
+    ghcr_actor: '{{ ghcr_actor }}'
+    ghcr_token: '{{ ghcr_token }}'
+
+  tasks:
+    # ── System update ──────────────────────────────────────────────────────────
+    - name: Wait for SSH to be fully ready
+      wait_for_connection:
+        timeout: 120
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      retries: 3
+      delay: 10
+      register: _apt_update
+      until: _apt_update is succeeded
+
+    # ── Python runtime ────────────────────────────────────────────────────────
+    - name: Install pip and venv (system Python)
+      apt:
+        name:
+          - python3-pip
+          - python3-venv
+          - python3-dev
+        state: present
+
+    - name: Install Python {{ python_version }} (try default repos first, deadsnakes as fallback)
+      block:
+        - name: Install from default apt repos
+          apt:
+            name:
+              - "python{{ python_version }}"
+              - "python{{ python_version }}-venv"
+              - "python{{ python_version }}-dev"
+            state: present
+            update_cache: yes
+      rescue:
+        - name: Add deadsnakes PPA via GPG key (older Ubuntu fallback)
+          shell: |
+            curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xF23C5A6CF475977595C89F51BA6932366A755776" \
+              | gpg --dearmor --yes -o /usr/share/keyrings/deadsnakes.gpg
+            . /etc/os-release
+            echo "deb [signed-by=/usr/share/keyrings/deadsnakes.gpg] https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu ${VERSION_CODENAME} main" \
+              | tee /etc/apt/sources.list.d/deadsnakes.list
+            apt-get update -qq
+          args:
+            executable: /bin/bash
+        - name: Install Python {{ python_version }} from deadsnakes
+          apt:
+            name:
+              - "python{{ python_version }}"
+              - "python{{ python_version }}-venv"
+              - "python{{ python_version }}-dev"
+            state: present
+            update_cache: yes
+      when: python_version not in ('3', '')
+
+    # ── Local database installation ───────────────────────────────────────────
+    - name: Install PostgreSQL server
+      apt:
+        name:
+          - postgresql
+          - postgresql-contrib
+        state: present
+        update_cache: yes
+
+    - name: Ensure PostgreSQL is started
+      systemd:
+        name: postgresql
+        state: started
+        enabled: yes
+
+    - name: Wait for PostgreSQL to be ready
+      wait_for:
+        port: 5432
+        host: 127.0.0.1
+        timeout: 60
+
+    - name: Create PostgreSQL database and user
+      shell: |
+        DB_NAME="{{ lookup('env', 'DB_NAME') | default(project | replace('-', '_') + 'db', true) }}"
+        DB_USER="{{ lookup('env', 'DB_USERNAME') | default('appuser', true) }}"
+        DB_PASS="{{ lookup('env', 'DB_PASSWORD') | default('apppass', true) }}"
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'" | grep -q 1 \
+          || sudo -u postgres psql -c "CREATE DATABASE \"$DB_NAME\";"
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='$DB_USER'" | grep -q 1 \
+          || sudo -u postgres psql -c "CREATE USER \"$DB_USER\" WITH PASSWORD '$DB_PASS';"
+        sudo -u postgres psql -c "ALTER USER \"$DB_USER\" WITH PASSWORD '$DB_PASS';"
+        sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"$DB_NAME\" TO \"$DB_USER\";"
+        sudo -u postgres psql -c "ALTER DATABASE \"$DB_NAME\" OWNER TO \"$DB_USER\";"
+      args:
+        executable: /bin/bash
+
+    # ── Web server (nginx / apache / none) ────────────────────────────────────
+    - name: Install Nginx
+      apt:
+        name: nginx
+        state: present
+        update_cache: yes
+
+    - name: Configure Nginx reverse proxy
+      copy:
+        dest: /etc/nginx/sites-available/app
+        content: |
+          server {
+            listen 80;
+            server_name _;
+            location / {
+              proxy_pass http://127.0.0.1:{{ app_port }};
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_read_timeout 120s;
+            }
+          }
+
+    - name: Enable Nginx site
+      file:
+        src: /etc/nginx/sites-available/app
+        dest: /etc/nginx/sites-enabled/app
+        state: link
+
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+
+    # ── App directory ─────────────────────────────────────────────────────────
+    - name: Create app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: '0755'
+
+    # ── Docker (GHCR) ─────────────────────────────────────────────────────────
+    - name: Install Docker
+      shell: |
+        curl -fsSL https://get.docker.com | sh
+      args:
+        executable: /bin/bash
+        creates: /usr/bin/docker
+
+    - name: Login to GHCR
+      shell: |
+        echo "{{ ghcr_token }}" | docker login ghcr.io -u "{{ ghcr_actor }}" --password-stdin
+      args:
+        executable: /bin/bash
+      no_log: true
+
+    - name: Pull image from GHCR
+      shell: docker pull "{{ docker_image }}"
+      args:
+        executable: /bin/bash
+
+    - name: Run container
+      shell: |
+        docker rm -f {{ project }} 2>/dev/null || true
+        docker run -d \
+          --name {{ project }} \
+          --restart always \
+          --network host \
+          -e PORT={{ app_port }} \
+          "{{ docker_image }}"
+      args:
+        executable: /bin/bash
+
+
+  handlers:
+    - name: Restart app
+      shell: |
+        docker rm -f {{ project }} 2>/dev/null || true
+        docker run -d --name {{ project }} --restart always --network host \
+          -e PORT={{ app_port }} "{{ docker_image }}"
+      args:
+        executable: /bin/bash
